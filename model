@@ -1,0 +1,585 @@
+# ============================================================================
+# AGRISTORM SENTINEL - MODEL 2.4
+# GITHUB INSPIRED LIGHTGBM + OPTUNA
+# TEMPORAL VALIDATION | RAJASTHAN
+# ==
+print("\n[1/9] Installing dependencies")
+
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q",
+     "lightgbm", "optuna"],
+    check=True
+)
+
+import lightgbm as lgb
+import optuna
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.base import clone
+
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score
+)
+
+from scipy.sparse import issparse
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+# ============================================================================
+# 2. CLONE GITHUB REFERENCE
+# ============================================================================
+
+print("\n[2/9] Loading GitHub reference")
+
+REPO_PATH = "/content/github_crop_yield_reference"
+
+if not os.path.exists(REPO_PATH):
+
+    subprocess.run(
+        [
+            "git", "clone", "--depth", "1",
+            "https://github.com/hasinii12/crop-yield-predictor.git",
+            REPO_PATH
+        ],
+        check=True
+    )
+
+print("GitHub reference loaded.")
+
+
+# ============================================================================
+# 3. DATA PREPARATION
+# ============================================================================
+
+print("\n[3/9] Preparing Rajasthan dataset")
+
+if "df" not in globals():
+    raise ValueError("Previous dataset variable df missing.")
+
+if "FEATURES" not in globals():
+    raise ValueError("FEATURES variable missing.")
+
+TARGET = "yield_change_pct"
+YEAR = "crop_year"
+
+if TARGET not in df.columns:
+    raise ValueError("yield_change_pct missing. Run target-generation cell.")
+
+data = df[
+    df["state"].astype(str).str.strip().str.lower()
+    == "rajasthan"
+].copy()
+
+data[TARGET] = pd.to_numeric(data[TARGET], errors="coerce")
+data[YEAR] = pd.to_numeric(data[YEAR], errors="coerce")
+
+data = data.replace([np.inf, -np.inf], np.nan)
+
+data = data.dropna(subset=[TARGET, YEAR]).copy()
+data[YEAR] = data[YEAR].astype(int)
+
+data = data[
+    data[TARGET].between(-100, 1000)
+].copy()
+
+train = data[data[YEAR] <= 2007].copy()
+test = data[data[YEAR].between(2008, 2010)].copy()
+
+if len(train) == 0 or len(test) == 0:
+    raise ValueError("Temporal split is empty.")
+
+print("Total records:", len(data))
+print("Training:", len(train))
+print("Testing:", len(test))
+
+print("Training years:", sorted(train[YEAR].unique()))
+print("Testing years:", sorted(test[YEAR].unique()))
+
+
+# ============================================================================
+# 4. FEATURE ENGINEERING AND PREPROCESSING
+# ============================================================================
+
+print("\n[4/9] Building preprocessing pipeline")
+
+FEATURES = list(FEATURES)
+
+categorical_features = [
+    c for c in FEATURES
+    if (
+        data[c].dtype == "object"
+        or str(data[c].dtype) == "category"
+        or str(data[c].dtype) == "bool"
+    )
+]
+
+numeric_features = [
+    c for c in FEATURES
+    if c not in categorical_features
+]
+
+numeric_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median"))
+])
+
+categorical_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(
+        handle_unknown="ignore"
+    ))
+])
+
+preprocessor = ColumnTransformer([
+    ("numeric", numeric_pipeline, numeric_features),
+    ("categorical", categorical_pipeline, categorical_features)
+])
+
+print("Numerical features:", len(numeric_features))
+print("Categorical features:", len(categorical_features))
+
+
+# ============================================================================
+# 5. TEMPORAL VALIDATION
+# ============================================================================
+
+print("\n[5/9] Preparing expanding-window validation")
+
+validation_years = [2005, 2006, 2007]
+
+folds = []
+
+for year in validation_years:
+
+    fold_train = train[train[YEAR] < year]
+    fold_valid = train[train[YEAR] == year]
+
+    if len(fold_train) < 50 or len(fold_valid) < 5:
+        continue
+
+    folds.append((fold_train, fold_valid))
+
+if len(folds) < 2:
+    raise ValueError("Not enough temporal validation folds.")
+
+print("Validation folds:", len(folds))
+
+
+# ============================================================================
+# 6. OPTUNA HYPERPARAMETER OPTIMIZATION
+# ============================================================================
+
+print("\n[6/9] OPTUNA HYPERPARAMETER OPTIMIZATION")
+
+def objective(trial):
+
+    params = {
+
+        "objective": "regression",
+        "metric": "mae",
+        "verbosity": -1,
+
+        "boosting_type": "gbdt",
+
+        "n_estimators": trial.suggest_int(
+            "n_estimators", 100, 700
+        ),
+
+        "learning_rate": trial.suggest_float(
+            "learning_rate", 0.005, 0.15, log=True
+        ),
+
+        "num_leaves": trial.suggest_int(
+            "num_leaves", 7, 63
+        ),
+
+        "max_depth": trial.suggest_int(
+            "max_depth", 3, 10
+        ),
+
+        "min_child_samples": trial.suggest_int(
+            "min_child_samples", 5, 40
+        ),
+
+        "subsample": trial.suggest_float(
+            "subsample", 0.65, 1.0
+        ),
+
+        "colsample_bytree": trial.suggest_float(
+            "colsample_bytree", 0.65, 1.0
+        ),
+
+        "reg_alpha": trial.suggest_float(
+            "reg_alpha", 1e-4, 10.0, log=True
+        ),
+
+        "reg_lambda": trial.suggest_float(
+            "reg_lambda", 1e-4, 10.0, log=True
+        ),
+
+        "random_state": 42,
+        "n_jobs": -1
+    }
+
+    fold_scores = []
+
+    for fold_train, fold_valid in folds:
+
+        X_train = fold_train[FEATURES]
+        y_train = fold_train[TARGET]
+
+        X_valid = fold_valid[FEATURES]
+        y_valid = fold_valid[TARGET]
+
+        prep = clone(preprocessor)
+
+        Xt = prep.fit_transform(X_train)
+        Xv = prep.transform(X_valid)
+
+        model = lgb.LGBMRegressor(**params)
+
+        model.fit(Xt, y_train)
+
+        predictions = model.predict(Xv)
+
+        score = mean_absolute_error(
+            y_valid,
+            predictions
+        )
+
+        fold_scores.append(score)
+
+    return float(np.mean(fold_scores))
+
+
+study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(seed=42)
+)
+
+N_TRIALS = 40
+
+study.optimize(
+    objective,
+    n_trials=N_TRIALS,
+    show_progress_bar=True
+)
+
+best_params = study.best_params
+
+print("\nBEST OPTUNA PARAMETERS")
+
+print(json.dumps(
+    best_params,
+    indent=4
+))
+
+print("\nBest temporal MAE:", study.best_value)
+
+
+# ============================================================================
+# 7. FINAL MODEL TRAINING
+# ============================================================================
+
+print("\n[7/9] Training final LightGBM model")
+
+X_train = train[FEATURES]
+y_train = train[TARGET]
+
+X_test = test[FEATURES]
+y_test = test[TARGET]
+
+final_preprocessor = clone(preprocessor)
+
+X_train_processed = final_preprocessor.fit_transform(
+    X_train
+)
+
+X_test_processed = final_preprocessor.transform(
+    X_test
+)
+
+final_model = lgb.LGBMRegressor(
+    **best_params,
+    objective="regression",
+    metric="mae",
+    verbosity=-1,
+    random_state=42,
+    n_jobs=-1
+)
+
+final_model.fit(
+    X_train_processed,
+    y_train
+)
+
+predictions = final_model.predict(
+    X_test_processed
+)
+
+
+# ============================================================================
+# 8. INDEPENDENT TEST EVALUATION
+# ============================================================================
+
+print("\n[8/9] Independent temporal test evaluation")
+
+mae = mean_absolute_error(y_test, predictions)
+
+rmse = np.sqrt(
+    mean_squared_error(y_test, predictions)
+)
+
+r2 = r2_score(y_test, predictions)
+
+# Baseline: training-set median
+baseline_prediction = np.full(
+    len(y_test),
+    y_train.median()
+)
+
+baseline_mae = mean_absolute_error(
+    y_test,
+    baseline_prediction
+)
+
+baseline_rmse = np.sqrt(
+    mean_squared_error(y_test, baseline_prediction)
+)
+
+baseline_r2 = r2_score(
+    y_test,
+    baseline_prediction
+)
+
+print("\n" + "=" * 60)
+print("FINAL PERFORMANCE")
+print("=" * 60)
+
+print(f"LightGBM MAE:  {mae:.4f}")
+print(f"LightGBM RMSE: {rmse:.4f}")
+print(f"LightGBM R2:   {r2:.4f}")
+
+print("\nBASELINE PERFORMANCE")
+
+print(f"Baseline MAE:  {baseline_mae:.4f}")
+print(f"Baseline RMSE: {baseline_rmse:.4f}")
+print(f"Baseline R2:   {baseline_r2:.4f}")
+
+improvement = (
+    (baseline_mae - mae) / baseline_mae * 100
+    if baseline_mae != 0 else 0
+)
+
+print(f"\nMAE improvement over baseline: {improvement:.2f}%")
+
+
+# ============================================================================
+# 9. EXPORT AND VERIFICATION
+# ============================================================================
+
+print("\n[9/9] Exporting verified model")
+
+OUTPUT = "/content/AgriStorm_Model_2_V2_4"
+
+os.makedirs(OUTPUT, exist_ok=True)
+os.makedirs(f"{OUTPUT}/model", exist_ok=True)
+os.makedirs(f"{OUTPUT}/evaluation", exist_ok=True)
+os.makedirs(f"{OUTPUT}/reports", exist_ok=True)
+
+# Predictions
+result = test[
+    [YEAR, "district_key", "dominant_crop", "season"]
+].copy()
+
+result["actual_yield_change_pct"] = y_test.values
+
+result["predicted_yield_change_pct"] = predictions
+
+result["absolute_error"] = np.abs(
+    y_test.values - predictions
+)
+
+result.to_csv(
+    f"{OUTPUT}/evaluation/predictions.csv",
+    index=False
+)
+
+# Crop-wise results
+crop_results = []
+
+for crop, group in result.groupby("dominant_crop"):
+
+    if len(group) < 3:
+        continue
+
+    crop_results.append({
+
+        "crop": str(crop),
+
+        "records": int(len(group)),
+
+        "MAE": float(mean_absolute_error(
+            group["actual_yield_change_pct"],
+            group["predicted_yield_change_pct"]
+        )),
+
+        "RMSE": float(np.sqrt(mean_squared_error(
+            group["actual_yield_change_pct"],
+            group["predicted_yield_change_pct"]
+        )))
+    })
+
+pd.DataFrame(crop_results).to_csv(
+    f"{OUTPUT}/evaluation/crop_wise_performance.csv",
+    index=False
+)
+
+# Feature importance
+importance = pd.DataFrame({
+
+    "feature": final_preprocessor.get_feature_names_out(),
+
+    "importance": final_model.feature_importances_
+
+}).sort_values(
+    "importance",
+    ascending=False
+)
+
+importance.to_csv(
+    f"{OUTPUT}/evaluation/feature_importance.csv",
+    index=False
+)
+
+# Model bundle
+bundle = {
+
+    "model": final_model,
+
+    "preprocessor": final_preprocessor,
+
+    "features": FEATURES,
+
+    "target": TARGET,
+
+    "algorithm": "LightGBM + Optuna",
+
+    "best_params": best_params,
+
+    "training_years": sorted(
+        train[YEAR].unique().tolist()
+    ),
+
+    "testing_years": sorted(
+        test[YEAR].unique().tolist()
+    )
+}
+
+joblib.dump(
+    bundle,
+    f"{OUTPUT}/model/crop_vulnerability_lgbm.pkl"
+)
+
+# Report
+report = {
+
+    "project": "AgriStorm Sentinel",
+
+    "model": "2.4",
+
+    "algorithm": "LightGBM + Optuna",
+
+    "region": "Rajasthan",
+
+    "target": TARGET,
+
+    "training_records": int(len(train)),
+
+    "testing_records": int(len(test)),
+
+    "metrics": {
+
+        "mae": float(mae),
+
+        "rmse": float(rmse),
+
+        "r2": float(r2),
+
+        "baseline_mae": float(baseline_mae),
+
+        "baseline_rmse": float(baseline_rmse),
+
+        "baseline_r2": float(baseline_r2),
+
+        "mae_improvement_percent": float(improvement)
+    },
+
+    "best_parameters": best_params,
+
+    "limitations": [
+
+        "Predicts historical yield change, not directly observed crop damage.",
+
+        "Evaluation is restricted to Rajasthan and the available historical period.",
+
+        "Performance must be independently validated before deployment."
+    ]
+}
+
+with open(
+    f"{OUTPUT}/reports/model_report.json",
+    "w"
+) as f:
+
+    json.dump(report, f, indent=4, allow_nan=False)
+
+
+# Reload test
+loaded = joblib.load(
+    f"{OUTPUT}/model/crop_vulnerability_lgbm.pkl"
+)
+
+check_X = test[FEATURES].head(5)
+
+check_processed = loaded["preprocessor"].transform(check_X)
+
+check_predictions = loaded["model"].predict(
+    check_processed
+)
+
+assert len(check_predictions) == 5
+assert np.isfinite(check_predictions).all()
+
+print("\n[PASS] Model reload")
+print("[PASS] Prediction verification")
+print("[PASS] Finite predictions")
+print("[PASS] Model metadata")
+
+# ZIP
+ZIP_PATH = shutil.make_archive(
+    OUTPUT,
+    "zip",
+    OUTPUT
+)
+
+print("\n" + "=" * 75)
+print("AGRISTORM MODEL 2.4 COMPLETED")
+print("=" * 75)
+
+print("Algorithm: LightGBM + Optuna")
+print("MAE:", round(mae, 4))
+print("RMSE:", round(rmse, 4))
+print("R2:", round(r2, 4))
+print("Baseline MAE:", round(baseline_mae, 4))
+print("ZIP:", ZIP_PATH)
+
+print("=" * 75)
+
+from google.colab import files
+files.download(ZIP_PATH)
